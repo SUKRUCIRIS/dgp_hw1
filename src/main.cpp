@@ -21,6 +21,7 @@
 #include <cmath>
 #include <mutex>
 #include <functional>
+#include <algorithm>
 
 using namespace easy3d;
 
@@ -43,7 +44,8 @@ float point_triangle_distance(const vec3 &p, const vec3 &a, const vec3 &b, const
 	float vc = d1 * d4 - d3 * d2;
 	if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
 	{
-		float v = d1 / (d1 - d3);
+		float denom = d1 - d3;
+		float v = (denom == 0.0f) ? 0.0f : d1 / denom;
 		return length(a + v * ab - p);
 	}
 
@@ -56,20 +58,26 @@ float point_triangle_distance(const vec3 &p, const vec3 &a, const vec3 &b, const
 	float vb = d5 * d2 - d1 * d6;
 	if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
 	{
-		float w = d2 / (d2 - d6);
+		float denom = d2 - d6;
+		float w = (denom == 0.0f) ? 0.0f : d2 / denom;
 		return length(a + w * ac - p);
 	}
 
 	float va = d3 * d6 - d5 * d4;
 	if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
 	{
-		float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+		float denom = (d4 - d3) + (d5 - d6);
+		float w = (denom == 0.0f) ? 0.0f : (d4 - d3) / denom;
 		return length(b + w * (c - b) - p);
 	}
 
-	float denom = 1.0f / (va + vb + vc);
-	float v = vb * denom;
-	float w = vc * denom;
+	float denom = va + vb + vc;
+	if (denom == 0.0f)
+	{
+		return std::min({length(ap), length(bp), length(cp)});
+	}
+	float v = vb / denom;
+	float w = vc / denom;
 	return length(a + ab * v + ac * w - p);
 }
 
@@ -156,7 +164,7 @@ void compute_and_dump_all_pairs(SurfaceMesh *mesh, const SurfaceMesh::EdgeProper
 {
 	int n = mesh->n_vertices();
 	std::vector<std::vector<float>> dist_matrix(n, std::vector<float>(n, 0.0f));
-	int num_threads = std::thread::hardware_concurrency();
+	int num_threads = std::max(1u, std::thread::hardware_concurrency());
 	std::vector<std::thread> threads;
 	std::atomic<int> current_idx(0);
 
@@ -181,17 +189,23 @@ void compute_and_dump_all_pairs(SurfaceMesh *mesh, const SurfaceMesh::EdgeProper
 		}
 	}
 
-	FILE *outfile = fopen("geodesic_matrix.bin", "wb");
+	FILE *outfile = fopen("geodesic_matrix.txt", "w");
 	if (outfile)
 	{
-		int rows = n, cols = n;
-		fwrite(&rows, sizeof(int), 1, outfile);
-		fwrite(&cols, sizeof(int), 1, outfile);
 		for (int i = 0; i < n; i++)
 		{
-			fwrite(dist_matrix[i].data(), sizeof(float), n, outfile);
+			for (int j = 0; j < n; j++)
+			{
+				fprintf(outfile, "%.6f ", dist_matrix[i][j]);
+			}
+			fprintf(outfile, "\n");
 		}
 		fclose(outfile);
+		std::cout << "Successfully wrote geodesic_matrix.txt to disk.\n";
+	}
+	else
+	{
+		std::cerr << "Error: Could not open geodesic_matrix.txt for writing.\n";
 	}
 }
 
@@ -203,14 +217,53 @@ SurfaceMesh *subdivide_4to1(SurfaceMesh *mesh)
 
 	for (auto v : mesh->vertices())
 	{
-		v_map[v] = out->add_vertex(mesh->position(v));
+		if (mesh->is_border(v))
+		{
+			vec3 pos = mesh->position(v) * 0.75f;
+			for (auto h : mesh->halfedges(v))
+			{
+				if (mesh->is_border(mesh->edge(h)))
+				{
+					pos += mesh->position(mesh->target(h)) * 0.125f;
+				}
+			}
+			v_map[v] = out->add_vertex(pos);
+		}
+		else
+		{
+			int n = 0;
+			vec3 neighbor_sum(0, 0, 0);
+			for (auto h : mesh->halfedges(v))
+			{
+				neighbor_sum += mesh->position(mesh->target(h));
+				n++;
+			}
+
+			float beta = 1.0f / n * (5.0f / 8.0f - std::pow(3.0f / 8.0f + 1.0f / 4.0f * std::cos(2.0f * M_PI / n), 2.0f));
+			vec3 new_pos = mesh->position(v) * (1.0f - n * beta) + neighbor_sum * beta;
+			v_map[v] = out->add_vertex(new_pos);
+		}
 	}
 
 	for (auto e : mesh->edges())
 	{
-		vec3 p0 = mesh->position(mesh->vertex(e, 0));
-		vec3 p1 = mesh->position(mesh->vertex(e, 1));
-		e_map[e] = out->add_vertex((p0 + p1) * 0.5f);
+		SurfaceMesh::Halfedge h0 = mesh->halfedge(e, 0);
+		vec3 p0 = mesh->position(mesh->source(h0));
+		vec3 p1 = mesh->position(mesh->target(h0));
+
+		if (mesh->is_border(e))
+		{
+			e_map[e] = out->add_vertex((p0 + p1) * 0.5f);
+		}
+		else
+		{
+			SurfaceMesh::Halfedge h1 = mesh->halfedge(e, 1);
+			vec3 p2 = mesh->position(mesh->target(mesh->next(h0)));
+			vec3 p3 = mesh->position(mesh->target(mesh->next(h1)));
+
+			vec3 new_pos = 0.375f * (p0 + p1) + 0.125f * (p2 + p3);
+			e_map[e] = out->add_vertex(new_pos);
+		}
 	}
 
 	for (auto f : mesh->faces())
@@ -250,16 +303,19 @@ SurfaceMesh *subdivide_phong(SurfaceMesh *mesh)
 		vec3 p0 = mesh->position(mesh->source(h0));
 		vec3 p1 = mesh->position(mesh->target(h0));
 		vec3 p2 = mesh->position(mesh->target(mesh->next(h0)));
-		vec3 n = normalize(cross(p1 - p0, p2 - p0));
+
+		vec3 cr = cross(p1 - p0, p2 - p0);
+		float len = length(cr);
+		vec3 n = len > 1e-8f ? cr / len : vec3(0, 0, 0);
+
 		for (auto v : mesh->vertices(f))
 			v_normal[v] += n;
 	}
+
 	for (auto v : mesh->vertices())
 	{
-		if (length(v_normal[v]) > 1e-6f)
-		{
-			v_normal[v] = normalize(v_normal[v]);
-		}
+		float len = length(v_normal[v]);
+		v_normal[v] = len > 1e-8f ? v_normal[v] / len : vec3(0, 1, 0);
 	}
 
 	SurfaceMesh *out = new SurfaceMesh();
@@ -273,8 +329,10 @@ SurfaceMesh *subdivide_phong(SurfaceMesh *mesh)
 
 	for (auto e : mesh->edges())
 	{
-		SurfaceMesh::Vertex v0 = mesh->vertex(e, 0);
-		SurfaceMesh::Vertex v1 = mesh->vertex(e, 1);
+		SurfaceMesh::Halfedge he0 = mesh->halfedge(e, 0);
+		SurfaceMesh::Vertex v0 = mesh->source(he0);
+		SurfaceMesh::Vertex v1 = mesh->target(he0);
+
 		vec3 p0 = mesh->position(v0);
 		vec3 p1 = mesh->position(v1);
 		vec3 n0 = v_normal[v0];
@@ -405,10 +463,44 @@ SurfaceMesh *run_subdiv(SurfaceMesh *m, int type, int iters)
 		else if (type == 2)
 			next = subdivide_phong(curr);
 
-		delete curr;
+		if (curr != m)
+			delete curr;
 		curr = next;
 	}
 	return curr;
+}
+
+void translate_mesh(SurfaceMesh *mesh, const vec3 &offset)
+{
+	if (!mesh)
+		return;
+	for (auto v : mesh->vertices())
+	{
+		mesh->position(v) += offset;
+	}
+}
+
+void print_mesh_stats(SurfaceMesh *mesh, const std::string &name)
+{
+	if (!mesh)
+		return;
+	int faces = mesh->n_faces();
+	float area = 0.0f;
+	for (auto f : mesh->faces())
+	{
+		auto h = mesh->halfedge(f);
+		vec3 p0 = mesh->position(mesh->source(h));
+
+		auto h_curr = mesh->next(h);
+		while (mesh->target(h_curr) != mesh->source(h))
+		{
+			vec3 p1 = mesh->position(mesh->source(h_curr));
+			vec3 p2 = mesh->position(mesh->target(h_curr));
+			area += 0.5f * length(cross(p1 - p0, p2 - p0));
+			h_curr = mesh->next(h_curr);
+		}
+	}
+	std::cout << name << " - Triangles/Polygons: " << faces << " | Total Area: " << area << "\n";
 }
 
 class HomeworkViewer : public Viewer
@@ -416,7 +508,6 @@ class HomeworkViewer : public Viewer
 public:
 	HomeworkViewer(const std::string &title) : Viewer(title)
 	{
-		current_mesh = nullptr;
 		geodesic_drawable = nullptr;
 	}
 
@@ -493,13 +584,17 @@ public:
 			geodesic_drawable = nullptr;
 		}
 
+		if (this->current_meshes.empty())
+			return;
+		SurfaceMesh *render_mesh = this->current_meshes[0];
+
 		std::vector<vec3> path_points;
 		std::vector<unsigned int> path_indices;
 
 		SurfaceMesh::Vertex curr = end;
 		while (curr.is_valid())
 		{
-			path_points.push_back(this->current_mesh->position(curr));
+			path_points.push_back(render_mesh->position(curr));
 			if (curr == start)
 				break;
 			curr = temp_parent[curr.idx()];
@@ -513,7 +608,7 @@ public:
 
 		if (!path_indices.empty())
 		{
-			auto line_drawable = new LinesDrawable("geodesic_path", this->current_mesh);
+			auto line_drawable = new LinesDrawable("geodesic_path", render_mesh);
 			line_drawable->update_vertex_buffer(path_points);
 			line_drawable->update_element_buffer(path_indices);
 			line_drawable->set_impostor_type(LinesDrawable::CYLINDER);
@@ -537,7 +632,7 @@ public:
 		process_pending_tasks();
 
 		bool disabled = is_processing.load();
-		bool mesh_unloaded = (current_mesh == nullptr);
+		bool mesh_unloaded = current_meshes.empty();
 
 		ImGui_ImplOpenGL3_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
@@ -553,13 +648,14 @@ public:
 
 		ImGui::BeginDisabled(disabled);
 
+		ImGui::Text("Input Decimated Mesh (~500 v)");
 		ImGui::PushItemWidth(200);
 		ImGui::InputText("##filepath", filepath, 512);
 		ImGui::PopItemWidth();
 		ImGui::SameLine();
-		if (ImGui::Button("Browse..."))
+		if (ImGui::Button("Browse...##1"))
 		{
-			auto sel = pfd::open_file("Select Mesh", ".", {"Mesh Files", "*.obj *.off *.ply *.stl *.sm", "All Files", "*"}).result();
+			auto sel = pfd::open_file("Select Decimated Mesh", ".", {"Mesh Files", "*.obj *.off *.ply *.stl *.sm", "All Files", "*"}).result();
 			if (!sel.empty())
 			{
 				strncpy(filepath, sel[0].c_str(), 511);
@@ -570,21 +666,41 @@ public:
 		if (ImGui::Button("Load Mesh"))
 		{
 			std::string fp(filepath);
-			run_async("Loading Mesh", [this, fp]()
-					  { this->temp_mesh = SurfaceMeshIO::load(fp); }, [this]()
+			run_async("Loading Decimated Mesh", [this, fp]()
+					  { 
+                          SurfaceMesh* m = SurfaceMeshIO::load(fp); 
+                          if(m) this->temp_meshes.push_back(m); }, [this]()
 					  {
-                    if (this->temp_mesh) {
-                        this->clear_scene(); 
-                        geodesic_drawable = nullptr; 
+                        if (!this->temp_meshes.empty()) {
+                            this->clear_scene(); 
+                            geodesic_drawable = nullptr; 
 
-                        this->current_mesh = this->temp_mesh;
-                        this->add_model(this->current_mesh);
-                        
-                        this->fit_screen();
-                        this->update();
-                    } else {
-                        std::cerr << "Failed to load mesh: " << this->filepath << "\n";
-                    } });
+                            this->current_meshes = this->temp_meshes;
+                            this->temp_meshes.clear();
+
+                            for (auto m : this->current_meshes) this->add_model(m);
+                            
+                            this->fit_screen();
+                            this->update();
+                        } else {
+                            std::cerr << "Failed to load mesh: " << this->filepath << "\n";
+                        } });
+		}
+
+		ImGui::Separator();
+		ImGui::Text("Original High-Res Mesh (For Comparison)");
+		ImGui::PushItemWidth(200);
+		ImGui::InputText("##filepath_orig", filepath_orig, 512);
+		ImGui::PopItemWidth();
+		ImGui::SameLine();
+		if (ImGui::Button("Browse...##2"))
+		{
+			auto sel = pfd::open_file("Select Original Mesh", ".", {"Mesh Files", "*.obj *.off *.ply *.stl *.sm", "All Files", "*"}).result();
+			if (!sel.empty())
+			{
+				strncpy(filepath_orig, sel[0].c_str(), 511);
+				filepath_orig[511] = '\0';
+			}
 		}
 
 		ImGui::EndDisabled();
@@ -596,7 +712,7 @@ public:
 		ImGui::InputInt("Start Vertex", &start_v);
 		ImGui::InputInt("End Vertex", &end_v);
 
-		if (ImGui::Button("Run Geodesic") && current_mesh)
+		if (ImGui::Button("Run Geodesic") && !current_meshes.empty())
 		{
 			SurfaceMesh::Vertex sv(start_v);
 			SurfaceMesh::Vertex ev(end_v);
@@ -606,18 +722,18 @@ public:
 				run_async("Computing Geodesic Path & Timings", [this, fp = std::string(filepath), sv, ev]()
 						  {
                         SurfaceMesh* base_mesh = SurfaceMeshIO::load(fp);
-                        if (!base_mesh) { this->temp_mesh = nullptr; return; }
+                        if (!base_mesh) return;
 
                         if (start_v >= base_mesh->n_vertices() || end_v >= base_mesh->n_vertices()) {
                             delete base_mesh;
-                            this->temp_mesh = nullptr;
                             return;
                         }
 
                         auto edge_lengths = base_mesh->add_edge_property<float>("e:length", 0.0f);
                         for (auto e : base_mesh->edges()) {
-                            SurfaceMesh::Vertex v0 = base_mesh->vertex(e, 0);
-                            SurfaceMesh::Vertex v1 = base_mesh->vertex(e, 1);
+                            SurfaceMesh::Halfedge he = base_mesh->halfedge(e, 0);
+                            SurfaceMesh::Vertex v0 = base_mesh->source(he);
+                            SurfaceMesh::Vertex v1 = base_mesh->target(he);
                             edge_lengths[e] = length(base_mesh->position(v0) - base_mesh->position(v1));
                         }
 
@@ -639,19 +755,23 @@ public:
                         std::cout << "Min-Heap priority queue: " << diff_heap.count() << " seconds\n";
                         std::cout << "----------------------------------------\n\n";
 
-                        this->temp_mesh = base_mesh; }, [this, sv, ev]()
+                        this->temp_meshes.push_back(base_mesh); }, [this, sv, ev]()
 						  {
-                        if (this->temp_mesh) {
+                        if (!this->temp_meshes.empty()) {
                             this->clear_scene();
                             geodesic_drawable = nullptr;
-                            this->current_mesh = this->temp_mesh;
-                            this->add_model(this->current_mesh);
+
+                            this->current_meshes = this->temp_meshes;
+                            this->temp_meshes.clear();
+
+                            for(auto m : this->current_meshes) this->add_model(m);
+
                             this->visualize_path(sv, ev);
                         } });
 			}
 		}
 
-		if (ImGui::Button("Dump Binary Matrix") && current_mesh)
+		if (ImGui::Button("Dump Matrix") && !current_meshes.empty())
 		{
 			run_async("Dumping Geodesic Matrix (Multithreaded)", [fp = std::string(filepath)]()
 					  {
@@ -659,8 +779,9 @@ public:
                     if (!base_mesh) return;
                     auto edge_lengths = base_mesh->add_edge_property<float>("e:length", 0.0f);
                     for (auto e : base_mesh->edges()) {
-                        SurfaceMesh::Vertex v0 = base_mesh->vertex(e, 0);
-                        SurfaceMesh::Vertex v1 = base_mesh->vertex(e, 1);
+                        SurfaceMesh::Halfedge he = base_mesh->halfedge(e, 0);
+                        SurfaceMesh::Vertex v0 = base_mesh->source(he);
+                        SurfaceMesh::Vertex v1 = base_mesh->target(he);
                         edge_lengths[e] = length(base_mesh->position(v0) - base_mesh->position(v1));
                     }
                     compute_and_dump_all_pairs(base_mesh, edge_lengths);
@@ -674,108 +795,176 @@ public:
 		ImGui::RadioButton("4-to-1", &subdiv_type, 1);
 		ImGui::SameLine();
 		ImGui::RadioButton("Phong", &subdiv_type, 2);
+		ImGui::SameLine();
+		ImGui::RadioButton("All Three", &subdiv_type, 3);
 		ImGui::InputInt("Iterations", &subdiv_iters);
 
-		if (ImGui::Button("Run Subdivision") && current_mesh)
+		if (ImGui::Button("Run Subdivision") && !current_meshes.empty())
 		{
-			run_async("Running Subdivision", [this, fp = std::string(filepath), type = subdiv_type, iters = subdiv_iters]()
+			run_async("Running Subdivision", [this, fp = std::string(filepath), fp_orig = std::string(filepath_orig), type = subdiv_type, iters = subdiv_iters]()
 					  {
-                    SurfaceMesh* base_mesh = SurfaceMeshIO::load(fp);
-                    if (!base_mesh) { this->temp_mesh = nullptr; return; }
+						  SurfaceMesh *base_mesh = SurfaceMeshIO::load(fp);
+						  if (!base_mesh)
+							  return;
 
-                    int orig_faces = base_mesh->n_faces();
-                    float orig_area = 0.0f;
-                    std::vector<vec3> orig_tris;
-                    for (auto f : base_mesh->faces()) {
-                        auto h = base_mesh->halfedge(f);
-                        vec3 p0 = base_mesh->position(base_mesh->source(h));
-                        vec3 p1 = base_mesh->position(base_mesh->target(h));
-                        vec3 p2 = base_mesh->position(base_mesh->target(base_mesh->next(h)));
-                        orig_tris.push_back(p0);
-                        orig_tris.push_back(p1);
-                        orig_tris.push_back(p2);
-                        orig_area += 0.5f * length(cross(p1 - p0, p2 - p0));
-                    }
+						  SurfaceMesh *orig_mesh = nullptr;
+						  if (!fp_orig.empty())
+						  {
+							  orig_mesh = SurfaceMeshIO::load(fp_orig);
+						  }
 
-                    if (iters == 0) {
-                        this->temp_mesh = base_mesh;
-                    } else {
-                        this->temp_mesh = run_subdiv(base_mesh, type, iters);
-                    }
+						  if (!orig_mesh)
+						  {
+							  std::cerr << "Warning: Could not load original high-res mesh. Falling back to comparison with decimated input mesh.\n";
+							  orig_mesh = SurfaceMeshIO::load(fp);
+						  }
 
-                    if (this->temp_mesh && iters > 0) {
-                        float new_area = 0.0f;
-                        int new_faces = this->temp_mesh->n_faces();
-                        for (auto f : this->temp_mesh->faces()) {
-                            auto h = this->temp_mesh->halfedge(f);
-                            vec3 p0 = this->temp_mesh->position(this->temp_mesh->source(h));
-                            vec3 p1 = this->temp_mesh->position(this->temp_mesh->target(h));
-                            vec3 p2 = this->temp_mesh->position(this->temp_mesh->target(this->temp_mesh->next(h)));
-                            new_area += 0.5f * length(cross(p1 - p0, p2 - p0));
-                        }
+						  std::cout << "\n----------------------------------------\n";
+						  std::cout << "Subdivision Area & Count Statistics:\n";
+						  print_mesh_stats(orig_mesh, "Original High-Res Ref.");
+						  print_mesh_stats(base_mesh, "Decimated Input");
 
-                        std::cout << "\n----------------------------------------\n";
-                        std::cout << "Subdivision Statistics:\n";
-                        std::cout << "Original Triangles:   " << orig_faces << "\n";
-                        std::cout << "Subdivided Triangles: " << new_faces << "\n";
-                        std::cout << "Original Area:        " << orig_area << "\n";
-                        std::cout << "Subdivided Area:      " << new_area << "\n";
+						  std::vector<vec3> reference_tris;
+						  for (auto f : orig_mesh->faces())
+						  {
+							  auto h = orig_mesh->halfedge(f);
+							  vec3 p0 = orig_mesh->position(orig_mesh->source(h));
+							  auto h_curr = orig_mesh->next(h);
+							  while (orig_mesh->target(h_curr) != orig_mesh->source(h))
+							  {
+								  vec3 p1 = orig_mesh->position(orig_mesh->source(h_curr));
+								  vec3 p2 = orig_mesh->position(orig_mesh->target(h_curr));
+								  reference_tris.push_back(p0);
+								  reference_tris.push_back(p1);
+								  reference_tris.push_back(p2);
+								  h_curr = orig_mesh->next(h_curr);
+							  }
+						  }
 
-                        int n_sub = this->temp_mesh->n_vertices();
-                        std::vector<float> dists(n_sub, 0.0f);
-                        int n_tris = orig_tris.size() / 3;
+						  if (iters == 0)
+						  {
+							  this->temp_meshes.push_back(base_mesh);
+							  if (orig_mesh && orig_mesh != base_mesh)
+								  delete orig_mesh;
+							  std::cout << "----------------------------------------\n\n";
+							  return;
+						  }
 
-                        int num_threads = std::thread::hardware_concurrency();
-                        std::vector<std::thread> threads;
-                        std::atomic<int> current_idx(0);
+						  auto process_subdiv = [&](int t, const std::string &name) -> SurfaceMesh *
+						  {
+							  SurfaceMesh *m = SurfaceMeshIO::load(fp);
+							  SurfaceMesh *res = run_subdiv(m, t, iters);
+							  print_mesh_stats(res, name + " Result");
 
-                        for (int t = 0; t < num_threads; ++t) {
-                            threads.emplace_back([&]() {
-                                while (true) {
-                                    int i = current_idx.fetch_add(1);
-                                    if (i >= n_sub) break;
-                                    
-                                    vec3 p = this->temp_mesh->position(SurfaceMesh::Vertex(i));
-                                    float min_d = std::numeric_limits<float>::infinity();
-                                    
-                                    for (int j = 0; j < n_tris; ++j) {
-                                        float d = point_triangle_distance(p, orig_tris[j*3], orig_tris[j*3+1], orig_tris[j*3+2]);
-                                        if (d < min_d) min_d = d;
-                                    }
-                                    dists[i] = min_d;
-                                }
-                            });
-                        }
+							  int n_sub = res->n_vertices();
+							  std::vector<float> dists(n_sub, 0.0f);
+							  int n_tris = reference_tris.size() / 3;
 
-                        for (auto& t : threads) {
-                            if (t.joinable()) t.join();
-                        }
+							  if (n_tris == 0)
+							  {
+								  std::fill(dists.begin(), dists.end(), 0.0f);
+							  }
+							  else
+							  {
+								  int num_threads = std::max(1u, std::thread::hardware_concurrency());
+								  std::vector<std::thread> threads;
+								  std::atomic<int> current_idx(0);
 
-                        float max_d = 0.0f;
-                        for (float d : dists) {
-                            if (d > max_d) max_d = d;
-                        }
+								  for (int th = 0; th < num_threads; ++th)
+								  {
+									  threads.emplace_back([&]()
+														   {
+                                    while (true) {
+                                        int i = current_idx.fetch_add(1);
+                                        if (i >= n_sub) break;
+                                        
+                                        vec3 p = res->position(SurfaceMesh::Vertex(i));
+                                        float min_d = std::numeric_limits<float>::infinity();
+                                        
+                                        for (int j = 0; j < n_tris; ++j) {
+                                            float d = point_triangle_distance(p, reference_tris[j*3], reference_tris[j*3+1], reference_tris[j*3+2]);
+                                            if (d < min_d) min_d = d;
+                                        }
+                                        dists[i] = min_d;
+                                    } });
+								  }
 
-                        std::cout << "Max distance to orig: " << max_d << "\n";
-                        std::cout << "----------------------------------------\n\n";
+								  for (auto &th : threads)
+								  {
+									  if (th.joinable())
+										  th.join();
+								  }
+							  }
 
-                        auto v_color = this->temp_mesh->add_vertex_property<vec3>("v:color", vec3(1,1,1));
-                        for (int i = 0; i < n_sub; ++i) {
-                            float normalized_d = max_d > 1e-8f ? dists[i] / max_d : 0.0f;
-                            v_color[SurfaceMesh::Vertex(i)] = vec3(normalized_d, 0.0f, 1.0f - normalized_d);
-                        }
-                    } }, [this]()
+							  float max_d = 1e-8f;
+							  for (float d : dists)
+							  {
+								  if (!std::isinf(d) && !std::isnan(d) && d > max_d)
+									  max_d = d;
+							  }
+
+							  std::cout << "   -> Max distance to original ref: " << max_d << "\n";
+
+							  auto v_color = res->add_vertex_property<vec3>("v:color", vec3(1, 1, 1));
+							  for (int i = 0; i < n_sub; ++i)
+							  {
+								  float d = dists[i];
+								  if (std::isinf(d) || std::isnan(d))
+									  d = max_d;
+								  float normalized_d = std::max(0.0f, std::min(1.0f, d / max_d));
+								  v_color[SurfaceMesh::Vertex(i)] = vec3(normalized_d, 0.0f, 1.0f - normalized_d);
+							  }
+							  return res;
+						  };
+
+						  if (type == 3)
+						  {								 
+							  SurfaceMesh *m0 = base_mesh; 
+							  SurfaceMesh *m1 = process_subdiv(0, "Sqrt(3)");
+							  SurfaceMesh *m2 = process_subdiv(1, "4-to-1");
+							  SurfaceMesh *m3 = process_subdiv(2, "Phong");
+
+							  float min_x = std::numeric_limits<float>::infinity();
+							  float max_x = -std::numeric_limits<float>::infinity();
+							  for (auto v : m0->vertices())
+							  {
+								  min_x = std::min(min_x, m0->position(v).x);
+								  max_x = std::max(max_x, m0->position(v).x);
+							  }
+							  float offset = (max_x - min_x) * 1.25f;
+
+							  translate_mesh(m1, vec3(offset, 0, 0));
+							  translate_mesh(m2, vec3(offset * 2, 0, 0));
+							  translate_mesh(m3, vec3(offset * 3, 0, 0));
+
+							  this->temp_meshes.push_back(m0);
+							  this->temp_meshes.push_back(m1);
+							  this->temp_meshes.push_back(m2);
+							  this->temp_meshes.push_back(m3);
+						  }
+						  else
+						  {
+							  SurfaceMesh *res = process_subdiv(type, "Subdivided");
+							  this->temp_meshes.push_back(res);
+							  delete base_mesh;
+						  }
+
+						  std::cout << "----------------------------------------\n\n";
+						  if (orig_mesh && orig_mesh != base_mesh)
+							  delete orig_mesh; }, [this]()
 					  {
-                    if (this->temp_mesh) {
-                        this->clear_scene();
-                        geodesic_drawable = nullptr; 
+                        if (!this->temp_meshes.empty()) {
+                            this->clear_scene();
+                            geodesic_drawable = nullptr; 
 
-                        this->current_mesh = this->temp_mesh;
-                        this->add_model(this->current_mesh);
-                        
-                        this->fit_screen();
-                        this->update();
-                    } });
+                            this->current_meshes = this->temp_meshes;
+                            this->temp_meshes.clear();
+
+                            for(auto m : this->current_meshes) this->add_model(m);
+                            
+                            this->fit_screen();
+                            this->update();
+                        } });
 		}
 
 		ImGui::EndDisabled();
@@ -793,7 +982,11 @@ public:
 
 private:
 	char filepath[512] = "";
-	SurfaceMesh *current_mesh;
+	char filepath_orig[512] = "";
+
+	std::vector<SurfaceMesh *> current_meshes;
+	std::vector<SurfaceMesh *> temp_meshes;
+
 	LinesDrawable *geodesic_drawable;
 
 	int start_v = 0;
@@ -807,7 +1000,6 @@ private:
 	std::mutex task_mutex;
 	std::function<void()> on_task_finished;
 
-	SurfaceMesh *temp_mesh = nullptr;
 	std::vector<float> temp_dist;
 	std::vector<SurfaceMesh::Vertex> temp_parent;
 };
