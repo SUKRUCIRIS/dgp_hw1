@@ -20,4 +20,5 @@ target_link_libraries(sukru_hw1
     easy3d::renderer 
     easy3d::algo 
     easy3d::core
+	3rd_imgui
 )
