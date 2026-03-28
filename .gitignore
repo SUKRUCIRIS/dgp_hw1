@@ -1,6 +1,8 @@
 build
 sukru_hw1
 sukru_hw1.*
+sukru_hw
+sukru_hw.*
 *.txt
 *.ini
 *.bin
