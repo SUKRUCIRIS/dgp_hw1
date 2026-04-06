@@ -12,6 +12,7 @@
 #include <functional>
 #include <string>
 #include <memory>
+#include <random>
 
 struct GridSample
 {
@@ -37,6 +38,7 @@ private:
 
 	int grid_res = 20;
 	int selected_cluster = -1;
+	int bfs_heuristic = 0;
 	bool show_highest_parity = false;
 	float discard_dist = 1.0f; // Stored as percentage of Bounding Box diagonal now
 
